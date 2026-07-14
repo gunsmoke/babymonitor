@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -56,6 +59,7 @@ func defaultConfig() Config {
 var (
 	configPath string
 	homeDir    string
+	baseDir    string
 )
 
 func loadConfig() (Config, error) {
@@ -82,28 +86,24 @@ func saveConfig(cfg Config) error {
 // --- Audio Device Discovery ---
 
 type AudioDevice struct {
-	ID          string `json:"id"`
-	Card        string `json:"card"`
-	CardNum     string `json:"card_num"`
-	Device      string `json:"device"`
-	DeviceNum   string `json:"device_num"`
-	Type        string `json:"type"` // "capture" or "playback"
+	ID        string `json:"id"`
+	Label     string `json:"label"` // human-friendly display name
+	Card      string `json:"card"`
+	CardNum   string `json:"card_num"`
+	Device    string `json:"device"`
+	DeviceNum string `json:"device_num"`
+	Type      string `json:"type"` // "capture" or "playback"
 }
 
 func listAudioDevices(deviceType string) ([]AudioDevice, error) {
-	flag := "-l"
+	cmd := "arecord"
 	dtype := "capture"
 	if deviceType == "playback" {
-		flag = "-l"
+		cmd = "aplay"
 		dtype = "playback"
 	}
 
-	cmd := "arecord"
-	if deviceType == "playback" {
-		cmd = "aplay"
-	}
-
-	out, err := exec.Command(cmd, flag).CombinedOutput()
+	out, err := exec.Command(cmd, "-l").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w: %s", cmd, err, string(out))
 	}
@@ -115,6 +115,7 @@ func listAudioDevices(deviceType string) ([]AudioDevice, error) {
 	for _, m := range matches {
 		devices = append(devices, AudioDevice{
 			ID:        fmt.Sprintf("hw:%s,%s", m[1], m[4]),
+			Label:     m[3],
 			CardNum:   m[1],
 			Card:      m[3],
 			DeviceNum: m[4],
@@ -125,37 +126,57 @@ func listAudioDevices(deviceType string) ([]AudioDevice, error) {
 	return devices, nil
 }
 
-// listPulseAudioSources returns PulseAudio/PipeWire sources (includes Bluetooth)
+// listPulseAudioSources returns PulseAudio/PipeWire input sources (includes
+// Bluetooth). It parses the full `pactl list sources` output to get the
+// human-friendly Description and the backing ALSA card number, which is used
+// to dedupe against the raw ALSA device list.
 func listPulseAudioSources() []AudioDevice {
-	out, err := exec.Command("pactl", "list", "sources", "short").CombinedOutput()
+	out, err := exec.Command("pactl", "list", "sources").CombinedOutput()
 	if err != nil {
 		return nil
 	}
+
 	var devices []AudioDevice
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
+	var name, desc, alsaCard string
+	flush := func() {
+		if name == "" || strings.Contains(name, ".monitor") {
+			return
 		}
-		name := fields[1]
-		// Skip monitors (output loopback) — we only want input sources
-		if strings.Contains(name, ".monitor") {
-			continue
+		label := desc
+		if label == "" {
+			label = name
 		}
-		label := name
-		// Try to make a friendlier label
 		if strings.Contains(name, "bluez") || strings.Contains(name, "bluetooth") {
-			label = "Bluetooth: " + name
+			label += " (Bluetooth)"
 		}
 		devices = append(devices, AudioDevice{
-			ID:       "pulse:" + name,
-			Card:     label,
-			CardNum:  "",
-			Device:   name,
-			DeviceNum: "",
-			Type:     "capture",
+			ID:      "pulse:" + name,
+			Label:   label,
+			Card:    label,
+			CardNum: alsaCard,
+			Device:  name,
+			Type:    "capture",
 		})
 	}
+
+	alsaCardRe := regexp.MustCompile(`alsa\.card\s*=\s*"(\d+)"`)
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Source #"):
+			flush()
+			name, desc, alsaCard = "", "", ""
+		case strings.HasPrefix(trimmed, "Name:"):
+			name = strings.TrimSpace(strings.TrimPrefix(trimmed, "Name:"))
+		case strings.HasPrefix(trimmed, "Description:"):
+			desc = strings.TrimSpace(strings.TrimPrefix(trimmed, "Description:"))
+		default:
+			if m := alsaCardRe.FindStringSubmatch(trimmed); m != nil {
+				alsaCard = m[1]
+			}
+		}
+	}
+	flush()
 	return devices
 }
 
@@ -453,13 +474,25 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetDevices(w http.ResponseWriter, r *http.Request) {
-	capture, _ := listAudioDevices("capture")
+	alsa, _ := listAudioDevices("capture")
 	playback, _ := listAudioDevices("playback")
 	pulse := listPulseAudioSources()
 
-	// Merge PulseAudio sources into capture list
-	if len(pulse) > 0 {
-		capture = append(capture, pulse...)
+	// Merge, deduplicating: PulseAudio sources wrap ALSA cards (alsa.card
+	// property), so drop raw hw: entries already represented by a source.
+	// Pulse entries come first — they have friendlier names and also work
+	// for Bluetooth devices.
+	capture := pulse
+	pulseCards := map[string]bool{}
+	for _, p := range pulse {
+		if p.CardNum != "" {
+			pulseCards[p.CardNum] = true
+		}
+	}
+	for _, a := range alsa {
+		if !pulseCards[a.CardNum] {
+			capture = append(capture, a)
+		}
 	}
 
 	resp := map[string]interface{}{
@@ -709,38 +742,83 @@ func handleScheduleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleReboot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "rebooting"})
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		exec.Command("sudo", "reboot").Run()
-	}()
+// powerPipePath is a FIFO created by the Docker entrypoint. A root-owned
+// helper loop reads actions from it and forwards them to the HOST's
+// systemd-logind over the bind-mounted D-Bus socket, so reboot/shutdown
+// affect the host machine, not just the container.
+const powerPipePath = "/run/babymonitor/power"
+
+func powerControlAvailable() bool {
+	if fi, err := os.Stat(powerPipePath); err == nil && fi.Mode()&os.ModeNamedPipe != 0 {
+		return true
+	}
+	_, err := exec.LookPath("sudo")
+	return err == nil
 }
 
-func handleShutdown(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "shutting down"})
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		exec.Command("sudo", "shutdown", "-h", "now").Run()
-	}()
+func performPowerAction(action string) {
+	// Docker: hand off to the root helper in the entrypoint
+	if fi, err := os.Stat(powerPipePath); err == nil && fi.Mode()&os.ModeNamedPipe != 0 {
+		f, err := os.OpenFile(powerPipePath, os.O_WRONLY, 0)
+		if err == nil {
+			defer f.Close()
+			if _, err := f.WriteString(action + "\n"); err == nil {
+				return
+			}
+		}
+		log.Printf("[power] pipe write failed: %v — trying fallback", err)
+	}
+	// Bare metal: classic sudo path
+	if action == "reboot" {
+		exec.Command("sudo", "-n", "reboot").Run()
+	} else {
+		exec.Command("sudo", "-n", "shutdown", "-h", "now").Run()
+	}
+}
+
+func handlePowerAction(action, status string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !powerControlAvailable() {
+			jsonError(w, "Power control not available in this environment", 501)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			performPowerAction(action)
+		}()
+	}
+}
+
+// inDocker reports whether we are running inside a container.
+func inDocker() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
 }
 
 func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	info := map[string]string{}
 
-	// Hostname
-	if h, err := os.Hostname(); err == nil {
+	// Hostname — inside Docker os.Hostname() is the container ID, so prefer
+	// the host's hostname bind-mounted by docker-compose.
+	if data, err := os.ReadFile("/etc/host-hostname"); err == nil && strings.TrimSpace(string(data)) != "" {
+		info["hostname"] = strings.TrimSpace(string(data))
+	} else if h, err := os.Hostname(); err == nil {
 		info["hostname"] = h
 	}
 
-	// Uptime
-	if out, err := exec.Command("uptime", "-p").Output(); err == nil {
-		info["uptime"] = strings.TrimSpace(string(out))
+	// Uptime — /proc/uptime is the host kernel's uptime, works in containers too.
+	if data, err := os.ReadFile("/proc/uptime"); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) > 0 {
+			if secs, err := strconv.ParseFloat(fields[0], 64); err == nil {
+				info["uptime"] = formatUptime(time.Duration(secs) * time.Second)
+			}
+		}
 	}
 
-	// CPU temp
+	// CPU temp — sysfs is the host kernel's.
 	if data, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp"); err == nil {
 		temp := strings.TrimSpace(string(data))
 		if len(temp) > 3 {
@@ -748,29 +826,84 @@ func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Memory
-	if out, err := exec.Command("free", "-h").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		if len(lines) > 1 {
-			info["memory"] = strings.TrimSpace(lines[1])
-		}
+	// Memory — /proc/meminfo is host-wide.
+	if total, avail, ok := readMemInfo(); ok {
+		info["memory"] = fmt.Sprintf("%s / %s used", humanBytes(total-avail), humanBytes(total))
 	}
 
-	// Disk
-	if out, err := exec.Command("df", "-h", "/").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		if len(lines) > 1 {
-			info["disk"] = strings.TrimSpace(lines[1])
-		}
+	// Disk — stat the data dir (host-backed volume) instead of parsing df of the overlay.
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(baseDir, &st); err == nil && st.Blocks > 0 {
+		total := uint64(st.Bsize) * st.Blocks
+		free := uint64(st.Bsize) * st.Bavail
+		info["disk"] = fmt.Sprintf("%s / %s used", humanBytes(total-free), humanBytes(total))
 	}
 
-	// IP
-	if out, err := exec.Command("hostname", "-I").Output(); err == nil {
-		info["ip"] = strings.TrimSpace(string(out))
+	// Address — inside Docker the container IP is useless; report the address
+	// the client actually reached us on.
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	info["ip"] = host
+
+	if inDocker() {
+		info["environment"] = "Docker"
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+func formatUptime(d time.Duration) string {
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	default:
+		return fmt.Sprintf("%dm", mins)
+	}
+}
+
+func readMemInfo() (total, avail uint64, ok bool) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "MemTotal:":
+			total = kb * 1024
+		case "MemAvailable:":
+			avail = kb * 1024
+		}
+	}
+	return total, avail, total > 0 && avail > 0
+}
+
+func humanBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%c", float64(b)/float64(div), "KMGTP"[exp])
 }
 
 // --- History Handlers ---
@@ -882,11 +1015,11 @@ func main() {
 	}
 
 	// Support env overrides for Docker
-	dataDir := os.Getenv("BABY_MONITOR_DIR")
-	if dataDir == "" {
-		dataDir = filepath.Join(homeDir, "babymonitor")
+	baseDir = os.Getenv("BABY_MONITOR_DIR")
+	if baseDir == "" {
+		baseDir = filepath.Join(homeDir, "babymonitor")
 	}
-	configPath = filepath.Join(dataDir, "config.json")
+	configPath = filepath.Join(baseDir, "config.json")
 
 	// Ensure config dir exists
 	os.MkdirAll(filepath.Dir(configPath), 0755)
@@ -936,8 +1069,8 @@ func main() {
 	mux.HandleFunc("GET /api/detector/stream", handleSSE)
 	mux.HandleFunc("GET /api/system", handleSystemInfo)
 	mux.HandleFunc("GET /api/schedule/status", handleScheduleStatus)
-	mux.HandleFunc("POST /api/system/reboot", handleReboot)
-	mux.HandleFunc("POST /api/system/shutdown", handleShutdown)
+	mux.HandleFunc("POST /api/system/reboot", handlePowerAction("reboot", "rebooting"))
+	mux.HandleFunc("POST /api/system/shutdown", handlePowerAction("shutdown", "shutting down"))
 	mux.HandleFunc("GET /api/history/stats", handleHistoryStats)
 	mux.HandleFunc("GET /api/history/events", handleHistoryEvents)
 	mux.HandleFunc("GET /api/history/daily", handleHistoryDaily)

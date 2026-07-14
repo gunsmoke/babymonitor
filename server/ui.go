@@ -607,15 +607,27 @@ async function loadSystemInfo() {
     const info = await api('system');
     const el = $('systemInfo');
     const items = [
-      { label: 'Name', value: info.hostname, icon: '' },
-      { label: 'Address', value: info.ip, icon: '' },
-      { label: 'Temperature', value: info.cpu_temp, icon: '' },
-      { label: 'Running for', value: info.uptime, icon: '' },
+      { label: 'Name', value: info.hostname },
+      { label: 'Address', value: info.ip },
+      { label: 'Temperature', value: info.cpu_temp },
+      { label: 'Up for', value: info.uptime },
+      { label: 'Memory', value: info.memory },
+      { label: 'Disk', value: info.disk },
+      { label: 'Runs in', value: info.environment },
     ];
-    el.innerHTML = items
-      .filter(i => i.value)
-      .map(i => '<div class="info-chip"><span class="chip-label">' + i.label + '</span><span class="chip-value">' + i.value + '</span></div>')
-      .join('');
+    el.innerHTML = '';
+    items.filter(i => i.value).forEach(i => {
+      const chip = document.createElement('div');
+      chip.className = 'info-chip';
+      const lbl = document.createElement('span');
+      lbl.className = 'chip-label';
+      lbl.textContent = i.label;
+      const val = document.createElement('span');
+      val.className = 'chip-value';
+      val.textContent = i.value;
+      chip.append(lbl, val);
+      el.appendChild(chip);
+    });
   } catch(e) {}
 }
 
@@ -627,13 +639,17 @@ async function loadDevices() {
     const sel = $('mic_device');
     const capture = data.capture || [];
 
-    // Populate device info section
+    // Populate device info section (textContent — device names are untrusted)
+    el.innerHTML = '';
     if (capture.length === 0) {
       el.innerHTML = '<span class="help">No microphones detected</span>';
     } else {
-      el.innerHTML = capture.map(d =>
-        '<div class="device-tag">&#x1F3A4; ' + d.card + ' &mdash; ' + d.device + '</div>'
-      ).join('');
+      for (const d of capture) {
+        const tag = document.createElement('div');
+        tag.className = 'device-tag';
+        tag.textContent = '\u{1F3A4} ' + (d.label || d.card);
+        el.appendChild(tag);
+      }
     }
 
     // Populate mic selector (keep current selection)
@@ -642,7 +658,7 @@ async function loadDevices() {
     for (const d of capture) {
       const opt = document.createElement('option');
       opt.value = d.id;
-      opt.textContent = d.card + ' - ' + d.device + ' (' + d.id + ')';
+      opt.textContent = (d.label || d.card) + (d.id.startsWith('hw:') ? ' (' + d.id + ')' : '');
       sel.appendChild(opt);
     }
     if (current) sel.value = current;

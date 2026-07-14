@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2-plugins \
     pulseaudio-utils \
     libpulse0 \
+    dbus-bin \
     cron \
     curl \
     ca-certificates \

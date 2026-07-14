@@ -64,6 +64,40 @@ if [ "$PULSE_FOUND" = true ]; then
     su -s /bin/bash babypi -c "PULSE_SERVER=$PULSE_SERVER pactl list sources short 2>/dev/null" || echo "  (could not query)"
 fi
 
+# --- Host power control (reboot/shutdown buttons in the UI) ---
+# The server runs as babypi and can't talk to host logind directly (polkit
+# denies non-root without an active session). This root-owned helper reads
+# actions from a FIFO and forwards them to the HOST's systemd-logind via the
+# bind-mounted D-Bus socket (/run/dbus).
+if [ -S /run/dbus/system_bus_socket ] && command -v dbus-send >/dev/null; then
+    mkdir -p /run/babymonitor
+    [ -p /run/babymonitor/power ] || mkfifo /run/babymonitor/power
+    chown babypi:babypi /run/babymonitor/power
+    (
+        while true; do
+            if read -r action < /run/babymonitor/power; then
+                case "$action" in
+                    reboot)
+                        echo "[power] Host reboot requested"
+                        dbus-send --system --print-reply --dest=org.freedesktop.login1 \
+                            /org/freedesktop/login1 org.freedesktop.login1.Manager.Reboot \
+                            boolean:false || echo "[power] Reboot call failed"
+                        ;;
+                    shutdown)
+                        echo "[power] Host shutdown requested"
+                        dbus-send --system --print-reply --dest=org.freedesktop.login1 \
+                            /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff \
+                            boolean:false || echo "[power] PowerOff call failed"
+                        ;;
+                esac
+            fi
+        done
+    ) &
+    echo "[entrypoint] Host power control enabled (D-Bus)"
+else
+    echo "[entrypoint] Host power control unavailable (no D-Bus socket or dbus-send)"
+fi
+
 # --- Start cron daemon (needed for schedule feature) ---
 service cron start 2>/dev/null || cron 2>/dev/null || true
 

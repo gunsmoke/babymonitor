@@ -12,8 +12,10 @@ services:
       # PulseAudio socket — enables Bluetooth audio devices (smartwatch, BT mic)
       # Override with PULSE_DIR if your UID is not 1000 (install.sh sets it)
       - ${PULSE_DIR:-/run/user/1000/pulse}:/run/user/1000/pulse
-      # D-Bus — needed for PulseAudio/PipeWire/Bluetooth communication
+      # D-Bus — PulseAudio/Bluetooth + host reboot/shutdown via logind
       - /run/dbus:/run/dbus:ro
+      # Host hostname for the system info card
+      - /etc/hostname:/etc/host-hostname:ro
     devices:
       - /dev/snd:/dev/snd                      # ALSA sound devices (USB mic)
     environment:
