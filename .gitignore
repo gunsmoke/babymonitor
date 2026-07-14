@@ -1,0 +1,24 @@
+# Binaries
+babymonitor-server
+*.exe
+
+# Data (persisted via volume)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+*.egg-info/
+
+# Go
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

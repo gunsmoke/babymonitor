@@ -1,0 +1,25 @@
+services:
+  babymonitor:
+    image: ${BABYMONITOR_IMAGE:-gunsmoke/babymonitor:latest}
+    build: .
+    container_name: babymonitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - babymonitor-data:/app/data             # config.json + babymonitor.db (persistent)
+      - ./model:/app/model:ro                  # ONNX model files (read-only)
+      # PulseAudio socket — enables Bluetooth audio devices (smartwatch, BT mic)
+      # Override with PULSE_DIR if your UID is not 1000 (install.sh sets it)
+      - ${PULSE_DIR:-/run/user/1000/pulse}:/run/user/1000/pulse
+      # D-Bus — needed for PulseAudio/PipeWire/Bluetooth communication
+      - /run/dbus:/run/dbus:ro
+    devices:
+      - /dev/snd:/dev/snd                      # ALSA sound devices (USB mic)
+    environment:
+      - TZ=${TZ:-Europe/London}
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+
+volumes:
+  babymonitor-data:
+    name: babymonitor-data
