@@ -89,6 +89,12 @@ elif [ -d "$INSTALL_DIR/.git" ]; then
     git -C "$INSTALL_DIR" pull --ff-only
 else
     command -v git >/dev/null || { log "Installing git..."; sudo apt-get update -qq && sudo apt-get install -y -qq git; }
+    if [ -e "$INSTALL_DIR" ]; then
+        # Existing non-git dir (e.g. manual copy) — move it aside; app data lives in the Docker volume
+        OLD_COPY="$INSTALL_DIR.old.$(date +%s)"
+        warn "$INSTALL_DIR exists but is not a git checkout — moving it to $OLD_COPY"
+        mv "$INSTALL_DIR" "$OLD_COPY"
+    fi
     log "Cloning $REPO_URL into $INSTALL_DIR"
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
 fi
