@@ -1,12 +1,20 @@
+# syntax=docker/dockerfile:1
+
 # --- Stage 1: Build Go server ---
 FROM golang:1.25-bookworm AS builder
 
 WORKDIR /build
+# Dependency layer first — only invalidated when go.mod/go.sum change
+COPY server/go.mod server/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Source layer — code changes only rebuild from here
 COPY server/ .
-RUN go mod download && CGO_ENABLED=0 go build -o babymonitor-server .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o babymonitor-server .
 
-# --- Stage 2: Runtime ---
-FROM debian:bookworm-slim
+# --- Stage 2: Runtime base (OS packages + Python deps; heavy, rarely changes) ---
+FROM debian:bookworm-slim AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
@@ -27,26 +35,27 @@ RUN useradd -m -s /bin/bash babypi && \
     usermod -aG audio,pulse-access babypi 2>/dev/null || \
     usermod -aG audio babypi
 
-WORKDIR /app
-
-# Copy Go binary
-COPY --from=builder /build/babymonitor-server .
-
-# Copy Python detector + bundled libs
-COPY detector/ ./detector/
-
-# Create Python venv and install deps
-RUN python3 -m venv /app/venv && \
-    /app/venv/bin/pip install --no-cache-dir \
+# Python venv with ML deps — the slowest layer, kept independent of app code
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m venv /app/venv && \
+    /app/venv/bin/pip install \
     numpy scipy python_speech_features opencv-python-headless
 
-# Create persistent directories
-RUN mkdir -p /app/data /app/model && \
-    chown -R babypi:babypi /app
+# --- Stage 3: Final image (fast-changing app code layers last) ---
+FROM runtime-base
 
-# Copy entrypoint
+WORKDIR /app
+
+# Persistent directories
+RUN mkdir -p /app/data /app/model && chown -R babypi:babypi /app
+
+# Entrypoint
 COPY scripts/docker-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# App code — changing these only rebuilds the layers below
+COPY detector/ ./detector/
+COPY --from=builder /build/babymonitor-server .
 
 ENV BABY_MONITOR_DIR=/app/data
 ENV BABY_MONITOR_DETECTOR=/app/detector/baby_monitor.py

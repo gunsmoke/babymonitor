@@ -20,9 +20,11 @@ AI-powered baby cry detection system. Go web server manages a Python subprocess 
 
 ## Build & Deploy
 - Local build/run: `docker compose up -d --build`
-- Release: `docker buildx build --platform linux/amd64,linux/arm64 -t gunsmoke/babymonitor:latest --push .`
+- Fast dev deploy to a Pi (~30-60s for code changes): `scripts/deploy-pi.sh <user@pi-host> [tag]`
+- Release: `docker buildx build --platform linux/amd64,linux/arm64 --cache-from type=registry,ref=gunsmoke/babymonitor:buildcache --cache-to type=registry,ref=gunsmoke/babymonitor:buildcache,mode=max -t gunsmoke/babymonitor:latest --push .`
 - Pi/user install: `bash scripts/install.sh` (pulls prebuilt image, falls back to local build)
-- Cross-compile (dev only): `GOOS=linux GOARCH=arm64 go build -o babymonitor-server ./server/`
+- Dockerfile is 3-stage: builder (Go), runtime-base (apt + pip, slow/stable), final (app code, fast). Keep code COPYs in the final stage so dev rebuilds stay fast.
+- buildx builder needs `--driver-opt network=host` on hosts with IPv6-only DNS answers
 
 ## Conventions
 - All timestamps stored in local time (not UTC)

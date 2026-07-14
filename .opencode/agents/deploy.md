@@ -12,15 +12,20 @@ Local Docker build/run:
 docker compose up -d --build
 ```
 
-Release a multi-arch image to Docker Hub (requires `docker login`):
+Fast dev deploy to a Pi (~30-60s for code changes, uses registry layer cache):
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 -t gunsmoke/babymonitor:latest --push .
+scripts/deploy-pi.sh <user@pi-host> [tag]
 ```
 
-Cross-compile the Go server only (dev):
+Release a multi-arch image to Docker Hub (requires `docker login`; also refreshes the build cache):
 ```bash
-GOOS=linux GOARCH=arm64 go build -o babymonitor-server ./server/
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --cache-from type=registry,ref=gunsmoke/babymonitor:buildcache \
+  --cache-to type=registry,ref=gunsmoke/babymonitor:buildcache,mode=max \
+  -t gunsmoke/babymonitor:latest --push .
 ```
+
+If dependencies changed (go.mod, pip packages, apt), refresh the cache from a dev deploy with `CACHE_PUSH=1 scripts/deploy-pi.sh <pi-host>`.
 
 ## Deploy to a Pi
 
