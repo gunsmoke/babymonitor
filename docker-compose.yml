@@ -16,8 +16,12 @@ services:
       - /run/dbus:/run/dbus:ro
       # Host hostname for the system info card
       - /etc/hostname:/etc/host-hostname:ro
+      # Docker socket — enables self-update from web UI
+      - /var/run/docker.sock:/var/run/docker.sock
     devices:
       - /dev/snd:/dev/snd                      # ALSA sound devices (USB mic)
+    # BLE smartwatch: uses BlueZ D-Bus API via /run/dbus mount above.
+    # If BLE fails, try adding: privileged: true
     environment:
       - TZ=${TZ:-Europe/London}
       - PULSE_SERVER=unix:/run/user/1000/pulse/native

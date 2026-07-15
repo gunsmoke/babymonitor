@@ -12,11 +12,25 @@ AI-powered baby cry detection system. Go web server manages a Python subprocess 
 ## Key Technical Details
 - Go 1.22+ ServeMux: route patterns must include method prefix (`"POST /api/..."`)
 - Pure-Go SQLite via `modernc.org/sqlite` (no CGO)
+- BLE via `tinygo.org/x/bluetooth` (pure Go, BlueZ D-Bus on Linux, no CGO)
 - UI is embedded as a Go string constant in `server/ui.go` (single-page, no build step)
 - Python detector outputs to stdout, Go parses lines via regex
 - Audio: ALSA (`arecord`) for USB mics, PulseAudio (`parec`) for Bluetooth devices
 - Detection regex: `ambient=(\d+)%\s+CRYING=(\d+)%\s+babbling=(\d+)%\s+->\s+(\w+)`
 - Env vars for Docker paths: `BABY_MONITOR_DIR`, `BABY_MONITOR_PYTHON`, `BABY_MONITOR_DETECTOR`, `BABY_MONITOR_MODEL_DIR`
+
+## BLE Smartwatch Support (Bangle.js)
+- `server/ble.go` — BLE connection manager using Nordic UART Service (NUS)
+- Connects to Bangle.js (1 or 2) and other Espruino devices over BLE
+- On cry alert: sends vibration + notification prompt to smartwatch
+- Smartwatch can dismiss alerts, start/stop monitoring
+- Auto-reconnects every 30s to disconnected devices
+- NUS UUIDs: Service `6e400001-...`, RX (write) `6e400002-...`, TX (notify) `6e400003-...`
+- BLE API endpoints: `GET /api/ble/scan`, `GET /api/ble/status`, `POST /api/ble/add`, `POST /api/ble/remove`, `POST /api/ble/connect`, `POST /api/ble/disconnect`, `POST /api/ble/test`
+- Config fields: `ble_devices` (array of `{address, name, type}`), `ble_alerts` (bool)
+- JS code is sent to Bangle.js at connect time via NUS to set up alert handler
+- Commands from Bangle.js arrive as JSON: `{"t":"cmd","cmd":"dismiss|start|stop"}`
+- Docker: requires `--privileged` or D-Bus + BLE device access for BLE to work
 
 ## Build & Deploy
 - Local build/run: `docker compose up -d --build`

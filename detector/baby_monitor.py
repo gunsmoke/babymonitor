@@ -140,9 +140,15 @@ class CryModel:
 # --- Notifier ---
 
 class CryNotifier:
-    """Tracks predictions over time and triggers alerts.
-    Requires X consecutive crying detections to fire.
-    Any non-crying detection resets the counter to zero.
+    """Tracks predictions over a sliding window and triggers alerts.
+
+    Uses a sliding window of the last `window_size` inference results
+    (quiet/skipped checks are not counted). Fires an alert when the
+    ratio of crying detections in the window >= `window_ratio`.
+
+    This handles intermittent crying (cry-pause-cry-pause) that would
+    reset a simple consecutive-streak counter, while still preventing
+    false positives from a single spurious detection.
     """
 
     def __init__(
@@ -150,12 +156,16 @@ class CryNotifier:
         consecutive=6,
         probability_threshold=0.80,
         min_interval=180,
+        window_ratio=0.50,
         **kwargs,  # ignore unused params from config
     ):
-        self.consecutive = consecutive
+        self.window_size = consecutive  # reuse consecutive param as window size
         self.probability_threshold = probability_threshold
         self.min_interval = min_interval
-        self.streak = 0
+        self.window_ratio = window_ratio
+        self.window = []  # list of bools: True=crying, False=not
+        self.streak = 0   # kept for display/logging
+        self.consecutive = consecutive  # kept for display/logging
         self.last_alert_time = -float("inf")
 
     def add(self, probs):
@@ -163,16 +173,29 @@ class CryNotifier:
         cry_prob = probs[1]  # index 1 = crying
         is_crying = cry_prob >= self.probability_threshold
 
+        # Update streak for logging
         if is_crying:
             self.streak += 1
         else:
             self.streak = 0
+
+        # Add to sliding window
+        self.window.append(is_crying)
+        if len(self.window) > self.window_size:
+            self.window.pop(0)
+
+        # Check if enough of the window is crying
+        if len(self.window) < min(3, self.window_size):
+            # Need at least 3 samples (or window_size if smaller) before alerting
             return False
 
+        cry_count = sum(self.window)
+        cry_ratio = cry_count / len(self.window)
+
         now = time.time()
-        if self.streak >= self.consecutive and (now - self.last_alert_time) > self.min_interval:
+        if cry_ratio >= self.window_ratio and (now - self.last_alert_time) > self.min_interval:
             self.last_alert_time = now
-            self.streak = 0
+            self.window.clear()
             return True
         return False
 
@@ -226,8 +249,8 @@ def main():
     parser.add_argument("--interval", type=float, default=5.0, help="Seconds between checks")
     parser.add_argument("--amplification", type=float, default=10.0, help="Audio amplification")
     parser.add_argument("--min-contrast", type=float, default=15.0, help="Min sound contrast over background")
-    parser.add_argument("--consecutive", type=int, default=6, help="Consecutive recordings to consider")
-    parser.add_argument("--fraction", type=float, default=0.5, help="Fraction of crying detections to trigger alert")
+    parser.add_argument("--consecutive", type=int, default=10, help="Sliding window size: number of recent detections to track")
+    parser.add_argument("--fraction", type=float, default=0.50, help="Alert when this ratio of the window is crying (0.0-1.0)")
     parser.add_argument("--prob-threshold", type=float, default=0.80, help="Probability threshold for crying")
     parser.add_argument("--cooldown", type=int, default=180, help="Min seconds between alerts")
     parser.add_argument("--threshold-only", action="store_true", help="Use simple loudness threshold (no NN)")
@@ -293,6 +316,7 @@ def main():
             consecutive=args.consecutive,
             probability_threshold=args.prob_threshold,
             min_interval=args.cooldown,
+            window_ratio=args.fraction,
         )
 
     print()
@@ -356,15 +380,18 @@ def main():
                     label_idx = np.argmax(probs)
                     label = CryModel.LABELS[label_idx]
 
+                    cry_in_window = sum(notifier.window) + (1 if probs[1] >= notifier.probability_threshold else 0)
+                    window_len = min(len(notifier.window) + 1, notifier.window_size)
                     print(
                         f"[{timestamp}] bg={bg_level:+.1f}dB  signal={signal_level:+.1f}dB  "
                         f"ambient={probs[0]:.0%}  CRYING={probs[1]:.0%}  babbling={probs[2]:.0%}  -> {label}"
                         f"  streak={notifier.streak}/{notifier.consecutive}"
+                        f"  window={cry_in_window}/{window_len}"
                     )
 
                     alert = notifier.add(probs)
                     if alert:
-                        print(f"[{timestamp}] *** ALERT: Baby is crying! ({args.consecutive} consecutive detections) ***")
+                        print(f"[{timestamp}] *** ALERT: Baby is crying! ({cry_in_window}/{window_len} detections in window) ***")
                         play_alert()
 
             # Wait for next interval

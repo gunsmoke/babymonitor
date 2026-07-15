@@ -374,6 +374,81 @@ const indexHTML = `<!DOCTYPE html>
   .alert-item:last-child { border-bottom: none; }
   .alert-time { color: var(--red); font-weight: 700; }
   .alert-date { color: var(--muted); font-size: 0.7rem; }
+
+  /* BLE Devices */
+  .ble-device {
+    background: var(--bg); border: 2px solid var(--border); border-radius: 0.75rem;
+    padding: 0.6rem 0.75rem; margin-bottom: 0.5rem; transition: border-color 0.2s;
+  }
+  .ble-device:hover { border-color: var(--accent); }
+  .ble-device-row {
+    display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  }
+  .ble-device-info { flex: 1; min-width: 0; }
+  .ble-device-name { font-weight: 700; font-size: 0.9rem; }
+  .ble-device-addr { font-size: 0.7rem; color: var(--muted); font-family: 'Courier New', monospace; }
+  .ble-status-dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  }
+  .ble-status-dot.connected { background: var(--green); }
+  .ble-status-dot.disconnected { background: var(--red); }
+  .ble-status-dot.connecting { background: var(--yellow); animation: pulse 1.5s infinite; }
+  .ble-device-actions { display: flex; gap: 0.3rem; }
+  .ble-scan-results {
+    max-height: 200px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  }
+  .ble-scan-item {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.5rem 0.6rem; border-radius: 0.5rem;
+    border-bottom: 1px solid var(--border); cursor: pointer;
+    transition: background 0.15s;
+  }
+  .ble-scan-item:hover { background: var(--accent-soft); }
+  .ble-scan-item:last-child { border-bottom: none; }
+  .ble-rssi { font-size: 0.65rem; color: var(--muted); min-width: 3rem; text-align: right; }
+  .ble-scanning {
+    text-align: center; padding: 1rem; color: var(--muted); font-size: 0.85rem;
+  }
+  .ble-scanning .spinner {
+    display: inline-block; width: 18px; height: 18px; border: 3px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite;
+    vertical-align: middle; margin-right: 0.5rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Update modal */
+  .update-overlay {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(74,63,53,0.85); z-index: 9999;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+  }
+  .update-modal {
+    background: var(--surface); border-radius: 1rem; padding: 1.5rem;
+    max-width: 380px; width: 90%; box-shadow: var(--shadow-lg); text-align: center;
+  }
+  .update-modal h3 { font-size: 1.1rem; margin-bottom: 1rem; }
+  .update-steps { text-align: left; margin: 1rem 0; }
+  .update-step {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.4rem 0; font-size: 0.85rem; color: var(--muted);
+    transition: color 0.2s;
+  }
+  .update-step.active { color: var(--text); font-weight: 700; }
+  .update-step.done { color: var(--green); }
+  .update-step.error { color: var(--red); }
+  .update-step-icon { width: 20px; text-align: center; flex-shrink: 0; }
+  .update-step.active .update-step-icon .spinner {
+    display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  .update-progress-bar {
+    height: 4px; background: var(--border); border-radius: 2px; margin: 0.75rem 0; overflow: hidden;
+  }
+  .update-progress-fill {
+    height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.5s ease;
+  }
+  .update-message { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; min-height: 1.2em; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
@@ -463,6 +538,35 @@ const indexHTML = `<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Smartwatch / BLE Devices -->
+    <div class="card">
+      <div class="card-header" onclick="toggleCard('ble')">
+        <span class="icon">&#x231A;</span>
+        <h2>Smartwatch</h2>
+        <span class="toggle-arrow open" id="arrow-ble">&#x25BC;</span>
+      </div>
+      <div class="card-body" id="body-ble">
+        <p class="help">Connect a Bangle.js smartwatch to receive vibration alerts and control the monitor from your wrist.</p>
+
+        <div id="bleDeviceList"></div>
+
+        <div class="checkbox-row" style="margin:0.75rem 0 0.5rem;">
+          <input type="checkbox" id="ble_alerts" checked>
+          <label for="ble_alerts" style="margin:0;">Send alerts to smartwatch</label>
+        </div>
+
+        <div class="btn-group" style="margin-top:0.5rem;">
+          <button class="btn btn-outline" id="btnBleScan" onclick="bleScan()">&#x1F50D; Scan for devices</button>
+          <button class="btn btn-outline" onclick="bleTest()">&#x1F514; Test alert</button>
+        </div>
+
+        <div id="bleScanResults" style="display:none; margin-top:0.75rem;">
+          <label>Nearby devices</label>
+          <div id="bleScanList" class="ble-scan-results"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- Sensitivity Settings -->
     <div class="card">
       <div class="card-header" onclick="toggleCard('settings')">
@@ -506,17 +610,17 @@ const indexHTML = `<!DOCTYPE html>
           </div>
           <div>
             <div class="slider-wrap">
-              <div class="slider-header"><label>Checks before alert</label><span class="slider-val" id="consecutive_val">6</span></div>
-              <input type="range" id="consecutive" min="1" max="20" step="1" oninput="$('consecutive_val').textContent=this.value">
+              <div class="slider-header"><label>Detection window</label><span class="slider-val" id="consecutive_val">10</span></div>
+              <input type="range" id="consecutive" min="3" max="20" step="1" oninput="$('consecutive_val').textContent=this.value">
             </div>
-            <p class="help">How many consecutive crying detections before alerting you.</p>
+            <p class="help">Number of recent detections to track. Alert fires when enough of these are crying.</p>
           </div>
           <div>
             <div class="slider-wrap">
-              <div class="slider-header"><label>Alert sensitivity</label><span class="slider-val" id="fraction_val">50%</span></div>
-              <input type="range" id="fraction" min="0" max="1" step="0.05" oninput="$('fraction_val').textContent=Math.round(this.value*100)+'%'">
+              <div class="slider-header"><label>Cry ratio to alert</label><span class="slider-val" id="fraction_val">50%</span></div>
+              <input type="range" id="fraction" min="0.2" max="1" step="0.05" oninput="$('fraction_val').textContent=Math.round(this.value*100)+'%'">
             </div>
-            <p class="help">0% = very sensitive, 100% = only alert on sustained crying.</p>
+            <p class="help">Alert when this % of the window is crying. Lower = more sensitive, catches intermittent crying. Higher = fewer false positives.</p>
           </div>
           <div>
             <div class="slider-wrap">
@@ -562,7 +666,14 @@ const indexHTML = `<!DOCTYPE html>
           <label style="margin-bottom:0.4rem;">Microphones</label>
           <div id="deviceList"><span class="help">Scanning...</span></div>
         </div>
+        <div id="storageInfo" style="margin-top:0.75rem; padding:0.5rem 0.6rem; background:var(--bg); border-radius:0.5rem; font-size:0.8rem;">
+          <span style="color:var(--muted);">Events: </span><span id="eventCount">-</span>
+          <span style="color:var(--muted); margin-left:0.75rem;">DB: </span><span id="dbSize">-</span>
+        </div>
         <div style="margin-top:1.25rem; padding-top:0.75rem; border-top:2px solid var(--border); display:flex; gap:0.5rem; flex-wrap:wrap;">
+          <button class="btn" id="btnUpdate" onclick="systemUpdate()" style="background:var(--accent);color:#fff;">&#x2B06; Update</button>
+          <button class="btn" onclick="systemCleanup()" style="background:var(--green);color:#fff;">&#x1F9F9; Cleanup</button>
+          <button class="btn" onclick="clearHistory()" style="background:var(--muted);color:#fff;">&#x1F5D1; Clear History</button>
           <button class="btn" onclick="systemAction('reboot')" style="background:var(--yellow);color:var(--text);">&#x1F504; Reboot</button>
           <button class="btn" onclick="systemAction('shutdown')" style="background:var(--red);color:#fff;">&#x23FB; Shutdown</button>
         </div>
@@ -628,6 +739,9 @@ async function loadSystemInfo() {
       chip.append(lbl, val);
       el.appendChild(chip);
     });
+    // Storage stats
+    if ($('eventCount')) $('eventCount').textContent = info.event_count || '0';
+    if ($('dbSize')) $('dbSize').textContent = info.db_size || '-';
   } catch(e) {}
 }
 
@@ -691,6 +805,8 @@ async function loadConfig() {
     $('cooldown_val').textContent = cd >= 60 ? Math.round(cd / 60) + ' min' : cd + 's';
     schedules = cfg.schedules || [];
     renderSchedules();
+    // BLE alerts toggle
+    $('ble_alerts').checked = cfg.ble_alerts !== false;
   } catch(e) {}
 }
 
@@ -707,6 +823,7 @@ async function saveConfig() {
       threshold_only: $('threshold_only').checked,
       mic_device: $('mic_device').value,
       schedules: schedules,
+      ble_alerts: $('ble_alerts').checked,
     };
     await api('config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) });
     showToast('Settings saved!');
@@ -919,6 +1036,192 @@ async function systemAction(action) {
   }
 }
 
+async function clearHistory() {
+  if (!confirm('Delete ALL detection history? This cannot be undone.')) return;
+  try {
+    const data = await api('system/clear-history', { method: 'POST' });
+    showToast('Cleared ' + data.deleted + ' events');
+    loadStats();
+    loadHistory();
+    loadSystemInfo();
+    var container = $('logContainer');
+    container.innerHTML = '<div class="log-line log-quiet">History cleared</div>';
+  } catch(e) {
+    showToast(e.message, true);
+  }
+}
+
+function systemCleanup() {
+  if (!confirm('Run cleanup? This removes old events, compacts the database, and prunes unused Docker images.')) return;
+
+  var overlay = document.createElement('div');
+  overlay.className = 'update-overlay';
+  overlay.innerHTML = '<div class="update-modal">' +
+    '<h3>&#x1F9F9; System Cleanup</h3>' +
+    '<div class="update-progress-bar"><div class="update-progress-fill" id="cleanupProgress" style="width:0%"></div></div>' +
+    '<div id="cleanupSteps" style="text-align:left;margin:1rem 0;font-size:0.85rem;"></div>' +
+    '<div class="update-message" id="cleanupMsg">Starting...</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+
+  var stepCount = 0;
+  var evtSrc = new EventSource('/api/system/cleanup');
+  evtSrc.onmessage = function(e) {
+    try {
+      var d = JSON.parse(e.data);
+      stepCount++;
+      var pct = Math.min(stepCount * 20, 100);
+      document.getElementById('cleanupProgress').style.width = pct + '%';
+      document.getElementById('cleanupMsg').textContent = d.message;
+
+      var step = document.createElement('div');
+      step.style.cssText = 'padding:0.2rem 0;color:' + (d.status === 'done' ? 'var(--green)' : 'var(--text)');
+      step.textContent = (d.status === 'done' ? '\u2713 ' : '\u2022 ') + d.message;
+      document.getElementById('cleanupSteps').appendChild(step);
+
+      if (d.status === 'done') {
+        evtSrc.close();
+        document.getElementById('cleanupProgress').style.width = '100%';
+        setTimeout(function() {
+          overlay.remove();
+          loadStats();
+          loadHistory();
+          loadSystemInfo();
+          showToast('Cleanup complete');
+        }, 2000);
+      }
+    } catch(ex) {}
+  };
+  evtSrc.onerror = function() {
+    evtSrc.close();
+    document.getElementById('cleanupMsg').textContent = 'Cleanup finished';
+    setTimeout(function() { overlay.remove(); }, 2000);
+  };
+}
+
+function systemUpdate() {
+  if (!confirm('Check for updates and restart? The monitor will be briefly offline.')) return;
+
+  var steps = [
+    {id:'start', label:'Preparing update'},
+    {id:'inspect', label:'Checking current version'},
+    {id:'pull', label:'Downloading latest image'},
+    {id:'compare', label:'Comparing versions'},
+    {id:'cleanup', label:'Cleaning up old images'},
+    {id:'restart', label:'Restarting'}
+  ];
+
+  // Build modal HTML
+  var stepsHtml = steps.map(function(s) {
+    return '<div class="update-step" id="ustep-'+s.id+'">' +
+      '<span class="update-step-icon"><span class="spinner" style="display:none"></span><span class="icon-txt"></span></span>' +
+      '<span>'+s.label+'</span></div>';
+  }).join('');
+
+  var overlay = document.createElement('div');
+  overlay.className = 'update-overlay';
+  overlay.innerHTML = '<div class="update-modal">' +
+    '<h3>&#x2B06; Updating Baby Monitor</h3>' +
+    '<div class="update-progress-bar"><div class="update-progress-fill" id="updateProgress" style="width:0%"></div></div>' +
+    '<div class="update-steps">' + stepsHtml + '</div>' +
+    '<div class="update-message" id="updateMsg">Starting...</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+
+  var stepIndex = {};
+  steps.forEach(function(s, i) { stepIndex[s.id] = i; });
+  var totalSteps = steps.length;
+
+  function setStep(id, status, msg) {
+    var el = document.getElementById('ustep-' + id);
+    if (!el) return;
+    // Clear all active states
+    steps.forEach(function(s) {
+      var e = document.getElementById('ustep-' + s.id);
+      if (e) e.className = 'update-step';
+    });
+    // Mark completed steps
+    var idx = stepIndex[id] || 0;
+    steps.forEach(function(s, i) {
+      var e = document.getElementById('ustep-' + s.id);
+      if (!e) return;
+      if (i < idx) {
+        e.className = 'update-step done';
+        e.querySelector('.spinner').style.display = 'none';
+        e.querySelector('.icon-txt').textContent = '\u2713';
+      }
+    });
+    // Set current step
+    if (status === 'error') {
+      el.className = 'update-step error';
+      el.querySelector('.spinner').style.display = 'none';
+      el.querySelector('.icon-txt').textContent = '\u2717';
+    } else {
+      el.className = 'update-step active';
+      el.querySelector('.spinner').style.display = 'inline-block';
+      el.querySelector('.icon-txt').textContent = '';
+    }
+    // Progress bar
+    var pct = Math.round(((idx + 1) / totalSteps) * 100);
+    var bar = document.getElementById('updateProgress');
+    if (bar) bar.style.width = pct + '%';
+    // Message
+    if (msg) document.getElementById('updateMsg').textContent = msg;
+  }
+
+  // Connect SSE to the update endpoint
+  var evtSrc = new EventSource('/api/system/update');
+  evtSrc.onmessage = function(e) {
+    try {
+      var d = JSON.parse(e.data);
+      setStep(d.step, d.status, d.message);
+
+      if (d.status === 'error') {
+        evtSrc.close();
+        document.getElementById('updateMsg').textContent = d.message;
+        setTimeout(function() { overlay.remove(); }, 4000);
+      }
+      if (d.status === 'uptodate') {
+        evtSrc.close();
+        steps.forEach(function(s) {
+          var e = document.getElementById('ustep-' + s.id);
+          if (e) { e.className = 'update-step done'; e.querySelector('.spinner').style.display = 'none'; e.querySelector('.icon-txt').textContent = '\u2713'; }
+        });
+        document.getElementById('updateProgress').style.width = '100%';
+        document.getElementById('updateMsg').textContent = d.message;
+        setTimeout(function() { overlay.remove(); }, 3000);
+      }
+      if (d.status === 'restart') {
+        evtSrc.close();
+        steps.forEach(function(s) {
+          var e = document.getElementById('ustep-' + s.id);
+          if (e) { e.className = 'update-step done'; e.querySelector('.spinner').style.display = 'none'; e.querySelector('.icon-txt').textContent = '\u2713'; }
+        });
+        document.getElementById('updateProgress').style.width = '100%';
+        document.getElementById('updateMsg').textContent = 'Restarting... please wait';
+        // Poll until server comes back
+        setTimeout(function poll() {
+          fetch('/api/detector/status').then(function(r) {
+            if (r.ok) { overlay.remove(); location.reload(); }
+            else setTimeout(poll, 2000);
+          }).catch(function() { setTimeout(poll, 2000); });
+        }, 5000);
+      }
+    } catch(ex) {}
+  };
+  evtSrc.onerror = function() {
+    evtSrc.close();
+    // Might be the restart — poll for comeback
+    document.getElementById('updateMsg').textContent = 'Connection lost -- waiting for restart...';
+    setTimeout(function poll() {
+      fetch('/api/detector/status').then(function(r) {
+        if (r.ok) { overlay.remove(); location.reload(); }
+        else setTimeout(poll, 2000);
+      }).catch(function() { setTimeout(poll, 2000); });
+    }, 3000);
+  };
+}
+
 // --- History & Charts ---
 let currentChartView = 'today';
 
@@ -1094,6 +1397,147 @@ async function loadHistory() {
   loadAlerts();
 }
 
+// --- BLE Smartwatch ---
+async function loadBLEStatus() {
+  try {
+    const data = await api('ble/status');
+    const el = $('bleDeviceList');
+    const devices = data.devices || [];
+
+    if (devices.length === 0) {
+      el.innerHTML = '<p class="help" style="padding:0.5rem 0;">No smartwatches paired. Tap "Scan for devices" to find one.</p>';
+      return;
+    }
+
+    el.innerHTML = devices.map(d => {
+      const statusClass = d.connected ? 'connected' : 'disconnected';
+      const statusText = d.connected ? 'Connected' : (d.error || 'Disconnected');
+      return '<div class="ble-device">' +
+        '<div class="ble-device-row">' +
+          '<span class="ble-status-dot ' + statusClass + '"></span>' +
+          '<div class="ble-device-info">' +
+            '<div class="ble-device-name">' + escapeHtml(d.device.name || 'Unknown') + '</div>' +
+            '<div class="ble-device-addr">' + escapeHtml(d.device.address) + ' &middot; ' + escapeHtml(statusText) + '</div>' +
+          '</div>' +
+          '<div class="ble-device-actions">' +
+            (d.connected
+              ? '<button class="sched-btn" onclick="bleDisconnect(\'' + d.device.address + '\')" title="Disconnect">&#x26D4;</button>'
+              : '<button class="sched-btn" onclick="bleConnect(\'' + d.device.address + '\')" title="Reconnect">&#x1F504;</button>') +
+            '<button class="sched-btn danger" onclick="bleRemove(\'' + d.device.address + '\')" title="Remove">&#x2715;</button>' +
+          '</div>' +
+        '</div></div>';
+    }).join('');
+  } catch(e) {}
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+async function bleScan() {
+  const btn = $('btnBleScan');
+  const resultsDiv = $('bleScanResults');
+  const listDiv = $('bleScanList');
+
+  btn.disabled = true;
+  btn.innerHTML = '&#x1F50D; Scanning...';
+  resultsDiv.style.display = 'block';
+  listDiv.innerHTML = '<div class="ble-scanning"><span class="spinner"></span>Scanning for Bangle.js watches...</div>';
+
+  try {
+    const results = await api('ble/scan');
+    if (!results || results.length === 0) {
+      listDiv.innerHTML = '<div class="ble-scanning">No Bangle.js devices found. Make sure your watch is nearby and awake.</div>';
+    } else {
+      listDiv.innerHTML = results.map(r => {
+        const rssiLabel = r.rssi > -60 ? 'Strong' : (r.rssi > -80 ? 'Good' : 'Weak');
+        return '<div class="ble-scan-item">' +
+          '<span class="ble-status-dot connecting"></span>' +
+          '<div class="ble-device-info">' +
+            '<div class="ble-device-name">' + escapeHtml(r.name) + '</div>' +
+            '<div class="ble-device-addr">' + escapeHtml(r.address) + ' &middot; ' + rssiLabel + '</div>' +
+          '</div>' +
+          '<button class="btn btn-primary" style="padding:0.4rem 0.8rem; font-size:0.75rem;" onclick="bleAdd(\'' + escapeHtml(r.address) + '\',\'' + escapeHtml(r.name) + '\')">+ Add</button>' +
+        '</div>';
+      }).join('');
+    }
+  } catch(e) {
+    listDiv.innerHTML = '<div class="ble-scanning">Scan failed: ' + escapeHtml(e.message) + '</div>';
+  }
+  btn.disabled = false;
+  btn.innerHTML = '&#x1F50D; Scan for devices';
+}
+
+async function bleAdd(address, name) {
+  try {
+    await api('ble/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address: address, name: name})
+    });
+    showToast('Smartwatch added! Connecting...');
+    $('bleScanResults').style.display = 'none';
+    loadBLEStatus();
+  } catch(e) {
+    showToast(e.message, true);
+  }
+}
+
+async function bleRemove(address) {
+  if (!confirm('Remove this smartwatch?')) return;
+  try {
+    await api('ble/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address: address})
+    });
+    showToast('Smartwatch removed');
+    loadBLEStatus();
+  } catch(e) {
+    showToast(e.message, true);
+  }
+}
+
+async function bleConnect(address) {
+  try {
+    await api('ble/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address: address})
+    });
+    showToast('Reconnecting...');
+    setTimeout(loadBLEStatus, 5000);
+  } catch(e) {
+    showToast(e.message, true);
+  }
+}
+
+async function bleDisconnect(address) {
+  try {
+    await api('ble/disconnect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address: address})
+    });
+    showToast('Disconnected');
+    loadBLEStatus();
+  } catch(e) {
+    showToast(e.message, true);
+  }
+}
+
+async function bleTest() {
+  try {
+    await api('ble/test', { method: 'POST' });
+    showToast('Test alert sent!');
+  } catch(e) {
+    showToast(e.message, true);
+  }
+}
+
 // --- Init ---
 async function init() {
   loadSystemInfo();
@@ -1102,12 +1546,14 @@ async function init() {
   await checkStatus();
   loadScheduleStatus();
   loadHistory();
+  loadBLEStatus();
 }
 init();
 
 setInterval(loadSystemInfo, 30000);
 setInterval(loadScheduleStatus, 30000);
 setInterval(loadStats, 30000);
+setInterval(loadBLEStatus, 15000);
 
 // Poll detector status every 5s to catch cron-triggered start/stop
 setInterval(async () => {

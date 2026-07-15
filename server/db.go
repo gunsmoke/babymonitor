@@ -45,6 +45,13 @@ func initDB() error {
 			key TEXT PRIMARY KEY,
 			value TEXT
 		);
+
+		CREATE TABLE IF NOT EXISTS ble_devices (
+			address TEXT PRIMARY KEY,
+			name TEXT NOT NULL DEFAULT '',
+			type TEXT NOT NULL DEFAULT 'generic',
+			added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
 	`)
 	if err != nil {
 		return err
@@ -53,6 +60,45 @@ func initDB() error {
 	// Prune old records (keep 30 days)
 	_, err = db.Exec(`DELETE FROM events WHERE timestamp < datetime('now', 'localtime', '-30 days')`)
 	return err
+}
+
+// dbClearHistory deletes all events and vacuums the database to reclaim space.
+func dbClearHistory() (int64, error) {
+	if db == nil {
+		return 0, fmt.Errorf("database not initialized")
+	}
+	result, err := db.Exec(`DELETE FROM events`)
+	if err != nil {
+		return 0, err
+	}
+	rows, _ := result.RowsAffected()
+	// VACUUM reclaims disk space from deleted rows
+	db.Exec(`VACUUM`)
+	return rows, nil
+}
+
+// dbSize returns the database file size in bytes.
+func dbSize() int64 {
+	dataDir := os.Getenv("BABY_MONITOR_DIR")
+	if dataDir == "" {
+		dataDir = filepath.Join(homeDir, "babymonitor")
+	}
+	dbPath := filepath.Join(dataDir, "babymonitor.db")
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// dbEventCount returns the total number of events.
+func dbEventCount() int64 {
+	if db == nil {
+		return 0
+	}
+	var count int64
+	db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&count)
+	return count
 }
 
 // Event types: "alert", "crying", "ambient", "babbling", "start", "stop"
@@ -105,6 +151,49 @@ func getRecentEvents(limit int) ([]RecentEvent, error) {
 		events = append(events, e)
 	}
 	return events, nil
+}
+
+// --- BLE Device Persistence ---
+
+func dbAddBLEDevice(dev BLEDevice) error {
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	_, err := db.Exec(
+		`INSERT INTO ble_devices (address, name, type) VALUES (?, ?, ?)
+		 ON CONFLICT(address) DO UPDATE SET name=?, type=?`,
+		dev.Address, dev.Name, dev.Type, dev.Name, dev.Type,
+	)
+	return err
+}
+
+func dbRemoveBLEDevice(address string) error {
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	_, err := db.Exec(`DELETE FROM ble_devices WHERE address=?`, address)
+	return err
+}
+
+func dbGetBLEDevices() ([]BLEDevice, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+	rows, err := db.Query(`SELECT address, name, type FROM ble_devices ORDER BY added_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var devices []BLEDevice
+	for rows.Next() {
+		var d BLEDevice
+		if err := rows.Scan(&d.Address, &d.Name, &d.Type); err != nil {
+			continue
+		}
+		devices = append(devices, d)
+	}
+	return devices, nil
 }
 
 // --- Persistent State ---

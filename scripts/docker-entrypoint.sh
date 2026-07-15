@@ -89,6 +89,9 @@ if [ -S /run/dbus/system_bus_socket ] && command -v dbus-send >/dev/null; then
                             /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff \
                             boolean:false || echo "[power] PowerOff call failed"
                         ;;
+                    update)
+                        echo "[update] Self-update requested via FIFO"
+                        ;;
                 esac
             fi
         done

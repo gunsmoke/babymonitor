@@ -28,6 +28,12 @@ type Schedule struct {
 	Days     []int  `json:"days"`     // 0=Sun, 1=Mon, ..., 6=Sat
 }
 
+type BLEDevice struct {
+	Address string `json:"address"` // MAC address
+	Name    string `json:"name"`    // Display name (e.g. "Bangle.js abcd")
+	Type    string `json:"type"`    // "banglejs1", "banglejs2", or "generic"
+}
+
 type Config struct {
 	Interval      float64    `json:"interval"`
 	Amplification float64    `json:"amplification"`
@@ -39,6 +45,7 @@ type Config struct {
 	ThresholdOnly bool       `json:"threshold_only"`
 	MicDevice     string     `json:"mic_device"`
 	Schedules     []Schedule `json:"schedules"`
+	BLEAlerts     bool       `json:"ble_alerts"` // send alerts to connected BLE devices
 }
 
 func defaultConfig() Config {
@@ -46,13 +53,14 @@ func defaultConfig() Config {
 		Interval:      5.0,
 		Amplification: 10.0,
 		MinContrast:   15.0,
-		Consecutive:   6,
-		Fraction:      0.5,
+		Consecutive:   10,
+		Fraction:      0.50,
 		ProbThreshold: 0.80,
 		Cooldown:      180,
 		ThresholdOnly: false,
 		MicDevice:     "",
 		Schedules:     []Schedule{},
+		BLEAlerts:     true,
 	}
 }
 
@@ -192,6 +200,7 @@ type DetectorState struct {
 	maxLogs         int
 	clients         map[chan LogEntry]bool
 	clientMu        sync.Mutex
+	done            chan struct{} // closed when the detector goroutine exits
 }
 
 type LogEntry struct {
@@ -246,10 +255,28 @@ func (d *DetectorState) Start(cfg Config) error {
 		d.mu.Unlock()
 		return fmt.Errorf("detector already running")
 	}
+	// Wait for any previous goroutine to fully exit
+	prevDone := d.done
+	d.mu.Unlock()
+	if prevDone != nil {
+		select {
+		case <-prevDone:
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("previous detector still shutting down, try again")
+		}
+	}
+
+	d.mu.Lock()
+	// Re-check after waiting — another Start may have won the race
+	if d.running {
+		d.mu.Unlock()
+		return fmt.Errorf("detector already running")
+	}
 	d.running = true
 	d.stoppedManually = false
 	d.lastCfg = cfg
 	d.logs = nil
+	d.done = make(chan struct{})
 	d.mu.Unlock()
 
 	setDesiredRunning(true)
@@ -266,6 +293,23 @@ func (d *DetectorState) Start(cfg Config) error {
 }
 
 func (d *DetectorState) runDetector(cfg Config) {
+	defer func() {
+		d.mu.Lock()
+		d.running = false
+		d.cmd = nil
+		done := d.done
+		d.mu.Unlock()
+		if done != nil {
+			close(done)
+		}
+		d.addLog(LogEntry{
+			Time:    time.Now().Format("15:04:05"),
+			Message: "Detector stopped",
+			Level:   "info",
+		})
+		logEvent("stop", "Detector stopped", 0, "")
+	}()
+
 	const maxRetries = 10
 	backoff := 2 * time.Second
 
@@ -310,16 +354,6 @@ func (d *DetectorState) runDetector(cfg Config) {
 			break
 		}
 	}
-
-	d.mu.Lock()
-	d.running = false
-	d.mu.Unlock()
-	d.addLog(LogEntry{
-		Time:    time.Now().Format("15:04:05"),
-		Message: "Detector stopped",
-		Level:   "info",
-	})
-	logEvent("stop", "Detector stopped", 0, "")
 }
 
 func (d *DetectorState) runDetectorOnce(cfg Config) int {
@@ -392,19 +426,39 @@ func (d *DetectorState) runDetectorOnce(cfg Config) int {
 
 func (d *DetectorState) Stop() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if !d.running || d.cmd == nil {
+	if !d.running {
+		d.mu.Unlock()
 		return fmt.Errorf("detector not running")
 	}
 
 	d.stoppedManually = true
 	setDesiredRunning(false)
 
-	if err := d.cmd.Process.Signal(os.Interrupt); err != nil {
-		d.cmd.Process.Kill()
+	cmd := d.cmd
+	done := d.done
+	d.mu.Unlock()
+
+	// Signal the process to stop
+	if cmd != nil && cmd.Process != nil {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			cmd.Process.Kill()
+		}
 	}
-	d.running = false
+
+	// Wait for the goroutine to finish (with timeout)
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			// Force kill if still alive
+			d.mu.RLock()
+			if d.cmd != nil && d.cmd.Process != nil {
+				d.cmd.Process.Kill()
+			}
+			d.mu.RUnlock()
+		}
+	}
+
 	return nil
 }
 
@@ -441,6 +495,8 @@ var detectionRe = regexp.MustCompile(`ambient=(\d+)%\s+CRYING=(\d+)%\s+babbling=
 func logDetectionLine(line string) {
 	if strings.Contains(line, "*** ALERT") {
 		logEvent("alert", line, 0, "")
+		// Send alert to connected BLE devices
+		bleManager.SendAlert("Baby is crying!")
 		return
 	}
 	if m := detectionRe.FindStringSubmatch(line); m != nil {
@@ -527,6 +583,11 @@ func handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 	if err := syncCrontab(cfg.Schedules); err != nil {
 		log.Printf("Warning: failed to sync crontab: %v", err)
 	}
+	// Update BLE alert setting
+	bleManager.mu.Lock()
+	bleManager.alertsOn = cfg.BLEAlerts
+	bleManager.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "saved"})
 }
@@ -541,6 +602,7 @@ func handleDetectorStart(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), 400)
 		return
 	}
+	go bleManager.SendStatus("Monitoring...")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 }
@@ -550,6 +612,7 @@ func handleDetectorStop(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), 400)
 		return
 	}
+	go bleManager.SendStatus("Stopped")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
@@ -797,6 +860,214 @@ func inDocker() bool {
 	return err == nil
 }
 
+// --- Cleanup & Reset ---
+
+func handleClearHistory(w http.ResponseWriter, r *http.Request) {
+	rows, err := dbClearHistory()
+	if err != nil {
+		jsonError(w, "Failed to clear history: "+err.Error(), 500)
+		return
+	}
+	detector.mu.Lock()
+	detector.logs = nil
+	detector.mu.Unlock()
+
+	log.Printf("[cleanup] Cleared %d events from database", rows)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "cleared",
+		"deleted": rows,
+	})
+}
+
+func handleSystemCleanup(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		jsonError(w, "streaming not supported", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	send := func(msg, status string) {
+		data := fmt.Sprintf(`{"message":"%s","status":"%s"}`, msg, status)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		log.Printf("[cleanup] %s", msg)
+	}
+
+	// 1. Clear old events (keep 7 days)
+	send("Clearing events older than 7 days...", "progress")
+	result, _ := db.Exec(`DELETE FROM events WHERE timestamp < datetime('now', 'localtime', '-7 days')`)
+	pruned, _ := result.RowsAffected()
+	send(fmt.Sprintf("Removed %d old events", pruned), "progress")
+
+	// 2. Vacuum database
+	send("Compacting database...", "progress")
+	sizeBefore := dbSize()
+	db.Exec(`VACUUM`)
+	sizeAfter := dbSize()
+	saved := sizeBefore - sizeAfter
+	if saved < 0 {
+		saved = 0
+	}
+	send(fmt.Sprintf("Database: %s (saved %s)", humanBytes(uint64(sizeAfter)), humanBytes(uint64(saved))), "progress")
+
+	// 3. Prune Docker images (if socket available)
+	if updateAvailable() {
+		send("Pruning unused Docker images...", "progress")
+		dockerAPI("POST", "/images/prune")
+		dockerAPI("POST", "/build/prune")
+		send("Docker images cleaned", "progress")
+	}
+
+	// 4. Clear detector logs from memory
+	detector.mu.Lock()
+	detector.logs = nil
+	detector.mu.Unlock()
+	send("In-memory logs cleared", "progress")
+
+	// 5. Report final disk usage
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(baseDir, &st); err == nil && st.Blocks > 0 {
+		total := uint64(st.Bsize) * st.Blocks
+		free := uint64(st.Bsize) * st.Bavail
+		send(fmt.Sprintf("Disk: %s free of %s", humanBytes(free), humanBytes(total)), "done")
+	} else {
+		send("Cleanup complete", "done")
+	}
+}
+
+// --- Self-Update via Docker Socket ---
+
+const dockerSockPath = "/var/run/docker.sock"
+const updateImage = "gunsmoke/babymonitor:latest"
+
+func updateAvailable() bool {
+	_, err := os.Stat(dockerSockPath)
+	return err == nil && inDocker()
+}
+
+// dockerAPI makes a request to the Docker Engine API via the unix socket.
+func dockerAPI(method, path string) ([]byte, error) {
+	conn, err := net.Dial("unix", dockerSockPath)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", method, path)
+	conn.Write([]byte(req))
+	return io.ReadAll(conn)
+}
+
+func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if !updateAvailable() {
+		jsonError(w, "Self-update not available (Docker socket not mounted)", 501)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		jsonError(w, "streaming not supported", 500)
+		return
+	}
+
+	// Stream progress as SSE events
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	send := func(step, msg, status string) {
+		data := fmt.Sprintf(`{"step":"%s","message":"%s","status":"%s"}`, step, msg, status)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		log.Printf("[update] %s: %s", step, msg)
+	}
+
+	send("start", "Starting update...", "progress")
+
+	hostname, _ := os.Hostname()
+
+	// 1. Inspect current image
+	send("inspect", "Checking current version...", "progress")
+	resp, err := dockerAPI("GET", "/containers/"+hostname+"/json")
+	if err != nil {
+		send("error", "Failed to inspect container: "+err.Error(), "error")
+		return
+	}
+	oldImageID := extractJSONField(string(resp), "Image")
+	if len(oldImageID) > 12 {
+		send("inspect", "Current: "+oldImageID[:12], "progress")
+	}
+
+	// 2. Pull latest image
+	send("pull", "Downloading latest image...", "progress")
+	parts := strings.SplitN(updateImage, ":", 2)
+	repo, tag := parts[0], "latest"
+	if len(parts) == 2 {
+		tag = parts[1]
+	}
+	pullResp, err := dockerAPI("POST", fmt.Sprintf("/images/create?fromImage=%s&tag=%s", repo, tag))
+	if err != nil {
+		send("error", "Download failed: "+err.Error(), "error")
+		return
+	}
+	pullStr := string(pullResp)
+	if strings.Contains(pullStr, "error") && strings.Contains(pullStr, "not found") {
+		send("error", "Image not found on Docker Hub", "error")
+		return
+	}
+	send("pull", "Download complete", "progress")
+
+	// 3. Compare images
+	send("compare", "Comparing versions...", "progress")
+	imgResp, _ := dockerAPI("GET", fmt.Sprintf("/images/%s:%s/json", repo, tag))
+	newImageID := extractJSONField(string(imgResp), "Id")
+
+	if newImageID != "" && newImageID == oldImageID {
+		send("done", "Already on latest version -- no update needed", "uptodate")
+		return
+	}
+	if len(newImageID) > 12 {
+		send("compare", "New version: "+newImageID[:12], "progress")
+	}
+
+	// 4. Cleanup old images
+	send("cleanup", "Cleaning up old images...", "progress")
+	dockerAPI("POST", "/images/prune")
+	send("cleanup", "Disk space freed", "progress")
+
+	// 5. Restart
+	send("restart", "Restarting with new version...", "restart")
+	time.Sleep(1 * time.Second)
+	dockerAPI("POST", "/containers/"+hostname+"/restart?t=5")
+}
+
+// extractJSONField does a simple extraction of a top-level JSON string field.
+// Not a full parser — just enough for Docker API responses.
+func extractJSONField(body, field string) string {
+	key := `"` + field + `":`
+	idx := strings.Index(body, key)
+	if idx < 0 {
+		return ""
+	}
+	rest := body[idx+len(key):]
+	rest = strings.TrimSpace(rest)
+	if len(rest) == 0 || rest[0] != '"' {
+		return ""
+	}
+	rest = rest[1:]
+	end := strings.Index(rest, `"`)
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
 func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	info := map[string]string{}
 
@@ -850,6 +1121,10 @@ func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if inDocker() {
 		info["environment"] = "Docker"
 	}
+
+	// DB stats
+	info["event_count"] = fmt.Sprintf("%d", dbEventCount())
+	info["db_size"] = humanBytes(uint64(dbSize()))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
@@ -1005,6 +1280,163 @@ func handleHistoryAlerts(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(alerts)
 }
 
+// --- BLE Handlers ---
+
+func handleBLEScan(w http.ResponseWriter, r *http.Request) {
+	results, err := bleManager.Scan(10 * time.Second)
+	if err != nil {
+		jsonError(w, "BLE scan failed: "+err.Error(), 500)
+		return
+	}
+	if results == nil {
+		results = []ScanResult{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+func handleBLEStatus(w http.ResponseWriter, r *http.Request) {
+	states := bleManager.GetStatus()
+	if states == nil {
+		states = []BLEConnectionState{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"devices": states,
+		"enabled": bleManager.enabled,
+	})
+}
+
+func handleBLEAdd(w http.ResponseWriter, r *http.Request) {
+	var dev BLEDevice
+	if err := json.NewDecoder(r.Body).Decode(&dev); err != nil {
+		jsonError(w, "invalid request: "+err.Error(), 400)
+		return
+	}
+	if dev.Address == "" {
+		jsonError(w, "address is required", 400)
+		return
+	}
+	if dev.Type == "" {
+		dev.Type = classifyBangleDevice(dev.Name)
+	}
+
+	// Persist to DB
+	if err := dbAddBLEDevice(dev); err != nil {
+		jsonError(w, err.Error(), 500)
+		return
+	}
+
+	// Ensure alerts are enabled from config
+	cfg, _ := loadConfig()
+	bleManager.mu.Lock()
+	bleManager.alertsOn = cfg.BLEAlerts
+	bleManager.mu.Unlock()
+
+	// Connect to the new device
+	go bleManager.connectDevice(dev)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "added"})
+}
+
+func handleBLERemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", 400)
+		return
+	}
+
+	// Disconnect
+	bleManager.DisconnectDevice(req.Address)
+
+	// Remove from DB
+	if err := dbRemoveBLEDevice(req.Address); err != nil {
+		jsonError(w, err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "removed"})
+}
+
+func handleBLEConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", 400)
+		return
+	}
+
+	// Find device in DB
+	devices, _ := dbGetBLEDevices()
+	for _, d := range devices {
+		if strings.EqualFold(d.Address, req.Address) {
+			go bleManager.connectDevice(d)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "connecting"})
+			return
+		}
+	}
+	jsonError(w, "device not found", 404)
+}
+
+func handleBLEDisconnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", 400)
+		return
+	}
+
+	bleManager.DisconnectDevice(req.Address)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "disconnected"})
+}
+
+func handleBLETest(w http.ResponseWriter, r *http.Request) {
+	// Test bypasses alertsOn — always sends to all connected devices
+	cmd := alertJS("Test alert!")
+	sent := 0
+
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.Address != "" {
+		// Test specific device
+		if err := bleManager.SendRaw(req.Address, cmd); err != nil {
+			jsonError(w, "send failed: "+err.Error(), 500)
+			return
+		}
+		sent = 1
+	} else {
+		// Test all connected devices
+		bleManager.mu.RLock()
+		for addr, cs := range bleManager.connections {
+			if cs.Connected {
+				bleManager.mu.RUnlock()
+				if err := bleManager.SendRaw(addr, cmd); err == nil {
+					sent++
+				}
+				bleManager.mu.RLock()
+			}
+		}
+		bleManager.mu.RUnlock()
+	}
+
+	if sent == 0 {
+		jsonError(w, "no connected devices", 400)
+		return
+	}
+	log.Printf("[ble] Test alert sent to %d device(s)", sent)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "test sent"})
+}
+
 // --- Main ---
 
 func main() {
@@ -1041,6 +1473,48 @@ func main() {
 		}
 	}
 
+	// Init BLE and connect to saved devices
+	if err := bleManager.Init(); err != nil {
+		log.Printf("Warning: BLE not available: %v (smartwatch features disabled)", err)
+	} else {
+		cfg, _ := loadConfig()
+		savedDevices, _ := dbGetBLEDevices()
+		if len(savedDevices) > 0 {
+			log.Printf("[ble] Connecting to %d saved device(s)...", len(savedDevices))
+			bleManager.ConnectDevices(savedDevices, cfg.BLEAlerts)
+		}
+		// Process commands from BLE devices (dismiss/start/stop)
+		go bleManager.ProcessCommands(
+			func() { // onDismiss
+				log.Printf("[ble] Alert dismissed from smartwatch")
+				detector.addLog(LogEntry{
+					Time:    time.Now().Format("15:04:05"),
+					Message: "Alert dismissed from smartwatch",
+					Level:   "info",
+				})
+			},
+			func() { // onStart
+				log.Printf("[ble] Start requested from smartwatch")
+				cfg, err := loadConfig()
+				if err != nil {
+					log.Printf("[ble] Failed to load config: %v", err)
+					return
+				}
+				if err := detector.Start(cfg); err != nil {
+					log.Printf("[ble] Failed to start detector: %v", err)
+					bleManager.SendStatus("Start failed")
+				}
+			},
+			func() { // onStop
+				log.Printf("[ble] Stop requested from smartwatch")
+				if err := detector.Stop(); err != nil {
+					log.Printf("[ble] Failed to stop detector: %v", err)
+					bleManager.SendStatus("Stop failed")
+				}
+			},
+		)
+	}
+
 	// Restore detector state from DB
 	if getDesiredRunning() {
 		log.Printf("Restoring detector state: was running before shutdown")
@@ -1071,11 +1545,22 @@ func main() {
 	mux.HandleFunc("GET /api/schedule/status", handleScheduleStatus)
 	mux.HandleFunc("POST /api/system/reboot", handlePowerAction("reboot", "rebooting"))
 	mux.HandleFunc("POST /api/system/shutdown", handlePowerAction("shutdown", "shutting down"))
+	mux.HandleFunc("POST /api/system/update", handleUpdate)
+	mux.HandleFunc("GET /api/system/update", handleUpdate)
+	mux.HandleFunc("POST /api/system/clear-history", handleClearHistory)
+	mux.HandleFunc("GET /api/system/cleanup", handleSystemCleanup)
 	mux.HandleFunc("GET /api/history/stats", handleHistoryStats)
 	mux.HandleFunc("GET /api/history/events", handleHistoryEvents)
 	mux.HandleFunc("GET /api/history/daily", handleHistoryDaily)
 	mux.HandleFunc("GET /api/history/chart", handleHistoryChart)
 	mux.HandleFunc("GET /api/history/alerts", handleHistoryAlerts)
+	mux.HandleFunc("GET /api/ble/scan", handleBLEScan)
+	mux.HandleFunc("GET /api/ble/status", handleBLEStatus)
+	mux.HandleFunc("POST /api/ble/add", handleBLEAdd)
+	mux.HandleFunc("POST /api/ble/remove", handleBLERemove)
+	mux.HandleFunc("POST /api/ble/connect", handleBLEConnect)
+	mux.HandleFunc("POST /api/ble/disconnect", handleBLEDisconnect)
+	mux.HandleFunc("POST /api/ble/test", handleBLETest)
 
 	port := "8080"
 	if p := os.Getenv("PORT"); p != "" {
