@@ -22,10 +22,10 @@ import (
 // --- Config ---
 
 type Schedule struct {
-	Enabled  bool   `json:"enabled"`
-	Start    string `json:"start"`    // "HH:MM" format
-	Stop     string `json:"stop"`     // "HH:MM" format
-	Days     []int  `json:"days"`     // 0=Sun, 1=Mon, ..., 6=Sat
+	Enabled bool   `json:"enabled"`
+	Start   string `json:"start"` // "HH:MM" format
+	Stop    string `json:"stop"`  // "HH:MM" format
+	Days    []int  `json:"days"`  // 0=Sun, 1=Mon, ..., 6=Sat
 }
 
 type BLEDevice struct {
@@ -193,6 +193,8 @@ func listPulseAudioSources() []AudioDevice {
 type DetectorState struct {
 	mu              sync.RWMutex
 	running         bool
+	ready           bool
+	stateSeq        uint64
 	stoppedManually bool
 	cmd             *exec.Cmd
 	lastCfg         Config
@@ -201,6 +203,8 @@ type DetectorState struct {
 	clients         map[chan LogEntry]bool
 	clientMu        sync.Mutex
 	done            chan struct{} // closed when the detector goroutine exits
+	stopCh          chan struct{} // closed to interrupt retry backoff
+	onStateChange   func()
 }
 
 type LogEntry struct {
@@ -273,11 +277,16 @@ func (d *DetectorState) Start(cfg Config) error {
 		return fmt.Errorf("detector already running")
 	}
 	d.running = true
+	d.ready = false
+	d.stateSeq++
 	d.stoppedManually = false
 	d.lastCfg = cfg
 	d.logs = nil
 	d.done = make(chan struct{})
+	d.stopCh = make(chan struct{})
 	d.mu.Unlock()
+	bleManager.ConfigureTelemetry(cfg)
+	d.notifyStateChange()
 
 	setDesiredRunning(true)
 
@@ -295,10 +304,18 @@ func (d *DetectorState) Start(cfg Config) error {
 func (d *DetectorState) runDetector(cfg Config) {
 	defer func() {
 		d.mu.Lock()
+		changed := d.running || d.ready
 		d.running = false
+		d.ready = false
+		if changed {
+			d.stateSeq++
+		}
 		d.cmd = nil
 		done := d.done
 		d.mu.Unlock()
+		if changed {
+			d.notifyStateChange()
+		}
 		if done != nil {
 			close(done)
 		}
@@ -345,7 +362,14 @@ func (d *DetectorState) runDetector(cfg Config) {
 		})
 		logEvent("alert", fmt.Sprintf("Detector crashed (exit %d), restarting attempt %d/%d", exitCode, attempt+1, maxRetries), 0, "")
 
-		time.Sleep(wait)
+		d.mu.RLock()
+		stopCh := d.stopCh
+		d.mu.RUnlock()
+		select {
+		case <-time.After(wait):
+		case <-stopCh:
+			return
+		}
 
 		d.mu.RLock()
 		stopped = d.stoppedManually
@@ -400,11 +424,18 @@ func (d *DetectorState) runDetectorOnce(cfg Config) int {
 
 	d.mu.Lock()
 	d.cmd = cmd
+	stopped := d.stoppedManually
 	d.mu.Unlock()
+	if stopped {
+		_ = cmd.Process.Kill()
+	}
 
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if line == "BABY_MONITOR_READY" {
+			d.setReady()
+		}
 		level := classifyLogLine(line)
 		d.addLog(LogEntry{
 			Time:    time.Now().Format("15:04:05"),
@@ -413,6 +444,7 @@ func (d *DetectorState) runDetectorOnce(cfg Config) int {
 		})
 		logDetectionLine(line)
 	}
+	d.clearReady()
 
 	err = cmd.Wait()
 	if err != nil {
@@ -431,7 +463,10 @@ func (d *DetectorState) Stop() error {
 		return fmt.Errorf("detector not running")
 	}
 
-	d.stoppedManually = true
+	if !d.stoppedManually {
+		d.stoppedManually = true
+		close(d.stopCh)
+	}
 	setDesiredRunning(false)
 
 	cmd := d.cmd
@@ -468,6 +503,52 @@ func (d *DetectorState) IsRunning() bool {
 	return d.running
 }
 
+func (d *DetectorState) Status() (running, ready bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.running, d.ready
+}
+
+func (d *DetectorState) StateSnapshot() (running, ready bool, seq uint64) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.running, d.ready, d.stateSeq
+}
+
+// State notifications must never hold up detector startup, shutdown, or retry.
+// Senders take a fresh snapshot after acquiring their own serialization lock.
+func (d *DetectorState) notifyStateChange() {
+	if d.onStateChange != nil {
+		go d.onStateChange()
+	}
+}
+
+func (d *DetectorState) setReady() {
+	d.mu.Lock()
+	changed := d.running && !d.stoppedManually && !d.ready
+	if changed {
+		d.ready = true
+		d.stateSeq++
+	}
+	d.mu.Unlock()
+	if changed {
+		d.notifyStateChange()
+	}
+}
+
+func (d *DetectorState) clearReady() {
+	d.mu.Lock()
+	changed := d.ready
+	d.ready = false
+	if changed {
+		d.stateSeq++
+	}
+	d.mu.Unlock()
+	if changed {
+		d.notifyStateChange()
+	}
+}
+
 func (d *DetectorState) GetLogs() []LogEntry {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -500,6 +581,10 @@ func logDetectionLine(line string) {
 		return
 	}
 	if m := detectionRe.FindStringSubmatch(line); m != nil {
+		ambient, _ := strconv.Atoi(m[1])
+		crying, _ := strconv.Atoi(m[2])
+		babbling, _ := strconv.Atoi(m[3])
+		bleManager.SendTelemetry(ambient, crying, babbling)
 		classification := m[4]
 		var prob float64
 		fmt.Sscanf(m[2], "%f", &prob)
@@ -509,6 +594,10 @@ func logDetectionLine(line string) {
 			eventType = "crying"
 		}
 		logEvent(eventType, line, prob, classification)
+		return
+	}
+	if strings.Contains(line, "bg=") {
+		bleManager.SendHeartbeat()
 	}
 }
 
@@ -587,6 +676,9 @@ func handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 	bleManager.mu.Lock()
 	bleManager.alertsOn = cfg.BLEAlerts
 	bleManager.mu.Unlock()
+	if !detector.IsRunning() {
+		bleManager.ConfigureTelemetry(cfg)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "saved"})
@@ -602,7 +694,6 @@ func handleDetectorStart(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), 400)
 		return
 	}
-	go bleManager.SendStatus("Monitoring...")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 }
@@ -612,15 +703,24 @@ func handleDetectorStop(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), 400)
 		return
 	}
-	go bleManager.SendStatus("Stopped")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
 
 func handleDetectorStatus(w http.ResponseWriter, r *http.Request) {
+	running, ready := detector.Status()
+	state := "stopped"
+	if running {
+		state = "starting"
+	}
+	if ready {
+		state = "listening"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"running": detector.IsRunning(),
+		"running": running,
+		"ready":   ready,
+		"state":   state,
 		"logs":    detector.GetLogs(),
 	})
 }
@@ -1440,6 +1540,10 @@ func handleBLETest(w http.ResponseWriter, r *http.Request) {
 // --- Main ---
 
 func main() {
+	detector.onStateChange = func() {
+		bleManager.SendStatus()
+	}
+
 	var err error
 	homeDir, err = os.UserHomeDir()
 	if err != nil {
@@ -1478,6 +1582,7 @@ func main() {
 		log.Printf("Warning: BLE not available: %v (smartwatch features disabled)", err)
 	} else {
 		cfg, _ := loadConfig()
+		bleManager.ConfigureTelemetry(cfg)
 		savedDevices, _ := dbGetBLEDevices()
 		if len(savedDevices) > 0 {
 			log.Printf("[ble] Connecting to %d saved device(s)...", len(savedDevices))
@@ -1502,14 +1607,12 @@ func main() {
 				}
 				if err := detector.Start(cfg); err != nil {
 					log.Printf("[ble] Failed to start detector: %v", err)
-					bleManager.SendStatus("Start failed")
 				}
 			},
 			func() { // onStop
 				log.Printf("[ble] Stop requested from smartwatch")
 				if err := detector.Stop(); err != nil {
 					log.Printf("[ble] Failed to stop detector: %v", err)
-					bleManager.SendStatus("Stop failed")
 				}
 			},
 		)

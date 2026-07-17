@@ -328,10 +328,11 @@ def main():
     print(f"  Checking every {args.interval}s | Cooldown: {args.cooldown}s")
     print("=" * 50)
     print()
-    print("Listening... (Ctrl+C to stop)")
+    print("Starting audio capture... (Ctrl+C to stop)")
     print()
 
     loud_count = 0
+    ready = False
 
     try:
         while True:
@@ -346,6 +347,12 @@ def main():
             feature, loudness = feature_extractor.compute_feature_and_loudness(waveform)
             if loudness is None or not hasattr(loudness, 'ndim') or loudness.ndim == 0 or loudness.size == 0:
                 continue
+            if not ready:
+                # Machine-readable readiness marker. Emitting this only after a
+                # successful capture avoids claiming readiness while the model
+                # is loading or an audio device is failing to produce samples.
+                print("BABY_MONITOR_READY")
+                ready = True
             analyzer.add_loudness(loudness)
             bg_level, signal_level = analyzer.get_loudness_levels()
 
