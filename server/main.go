@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1050,17 +1052,36 @@ func updateAvailable() bool {
 	return err == nil && inDocker()
 }
 
-// dockerAPI makes a request to the Docker Engine API via the unix socket.
+// dockerTransport talks to the Docker Engine API via the unix socket.
+var dockerTransport = &http.Transport{
+	DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+		return net.Dial("unix", dockerSockPath)
+	},
+}
+var dockerClient = &http.Client{Transport: dockerTransport, Timeout: 120 * time.Second}
+
 func dockerAPI(method, path string) ([]byte, error) {
-	conn, err := net.Dial("unix", dockerSockPath)
+	return dockerAPIWithBody(method, path, nil)
+}
+
+func dockerAPIWithBody(method, path string, body []byte) ([]byte, error) {
+	var reqBody io.Reader
+	if body != nil {
+		reqBody = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, "http://localhost"+path, reqBody)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", method, path)
-	conn.Write([]byte(req))
-	return io.ReadAll(conn)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := dockerClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1092,16 +1113,43 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	hostname, _ := os.Hostname()
 
-	// 1. Inspect current image
+	// 1. Inspect current container
 	send("inspect", "Checking current version...", "progress")
-	resp, err := dockerAPI("GET", "/containers/"+hostname+"/json")
+	inspectBytes, err := dockerAPI("GET", "/containers/"+hostname+"/json")
 	if err != nil {
-		send("error", "Failed to inspect container: "+err.Error(), "error")
+		send("inspect", "Failed to inspect container: "+err.Error(), "error")
 		return
 	}
-	oldImageID := extractJSONField(string(resp), "Image")
-	if len(oldImageID) > 12 {
-		send("inspect", "Current: "+oldImageID[:12], "progress")
+
+	var inspect struct {
+		Name   string `json:"Name"`
+		Image  string `json:"Image"`
+		Config struct {
+			Image        string            `json:"Image"`
+			Hostname     string            `json:"Hostname"`
+			Domainname   string            `json:"Domainname"`
+			User         string            `json:"User"`
+			Env          []string          `json:"Env"`
+			Cmd          json.RawMessage   `json:"Cmd"`
+			Entrypoint   json.RawMessage   `json:"Entrypoint"`
+			WorkingDir   string            `json:"WorkingDir"`
+			Labels       map[string]string `json:"Labels"`
+			ExposedPorts json.RawMessage   `json:"ExposedPorts"`
+			Volumes      json.RawMessage   `json:"Volumes"`
+		} `json:"Config"`
+		HostConfig      json.RawMessage `json:"HostConfig"`
+		NetworkSettings struct {
+			Networks json.RawMessage `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.Unmarshal(inspectBytes, &inspect); err != nil {
+		send("inspect", "Failed to parse container config: "+err.Error(), "error")
+		return
+	}
+
+	oldImageID := inspect.Image
+	if len(oldImageID) > 19 {
+		send("inspect", "Current: "+oldImageID[7:19], "progress")
 	}
 
 	// 2. Pull latest image
@@ -1113,12 +1161,12 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	pullResp, err := dockerAPI("POST", fmt.Sprintf("/images/create?fromImage=%s&tag=%s", repo, tag))
 	if err != nil {
-		send("error", "Download failed: "+err.Error(), "error")
+		send("pull", "Download failed: "+err.Error(), "error")
 		return
 	}
 	pullStr := string(pullResp)
 	if strings.Contains(pullStr, "error") && strings.Contains(pullStr, "not found") {
-		send("error", "Image not found on Docker Hub", "error")
+		send("pull", "Image not found on Docker Hub", "error")
 		return
 	}
 	send("pull", "Download complete", "progress")
@@ -1126,14 +1174,17 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// 3. Compare images
 	send("compare", "Comparing versions...", "progress")
 	imgResp, _ := dockerAPI("GET", fmt.Sprintf("/images/%s:%s/json", repo, tag))
-	newImageID := extractJSONField(string(imgResp), "Id")
+	var imgInfo struct {
+		Id string `json:"Id"`
+	}
+	json.Unmarshal(imgResp, &imgInfo)
 
-	if newImageID != "" && newImageID == oldImageID {
+	if imgInfo.Id != "" && imgInfo.Id == oldImageID {
 		send("done", "Already on latest version -- no update needed", "uptodate")
 		return
 	}
-	if len(newImageID) > 12 {
-		send("compare", "New version: "+newImageID[:12], "progress")
+	if len(imgInfo.Id) > 19 {
+		send("compare", "New version: "+imgInfo.Id[7:19], "progress")
 	}
 
 	// 4. Cleanup old images
@@ -1141,31 +1192,102 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	dockerAPI("POST", "/images/prune")
 	send("cleanup", "Disk space freed", "progress")
 
-	// 5. Restart
+	// 5. Recreate container via a sidecar updater.
+	// A simple docker restart does NOT pick up the new image; the container
+	// must be removed and recreated. We spawn a short-lived helper container
+	// that stops this container, recreates it with the new image, and starts it.
 	send("restart", "Restarting with new version...", "restart")
-	time.Sleep(1 * time.Second)
-	dockerAPI("POST", "/containers/"+hostname+"/restart?t=5")
-}
 
-// extractJSONField does a simple extraction of a top-level JSON string field.
-// Not a full parser — just enough for Docker API responses.
-func extractJSONField(body, field string) string {
-	key := `"` + field + `":`
-	idx := strings.Index(body, key)
-	if idx < 0 {
-		return ""
+	containerName := strings.TrimPrefix(inspect.Name, "/")
+
+	// Build the create body for the new container (same config, new image).
+	createBody := map[string]interface{}{
+		"Hostname":     inspect.Config.Hostname,
+		"Domainname":   inspect.Config.Domainname,
+		"User":         inspect.Config.User,
+		"Env":          inspect.Config.Env,
+		"Cmd":          inspect.Config.Cmd,
+		"Entrypoint":   inspect.Config.Entrypoint,
+		"Image":        updateImage,
+		"WorkingDir":   inspect.Config.WorkingDir,
+		"Labels":       inspect.Config.Labels,
+		"ExposedPorts": inspect.Config.ExposedPorts,
+		"Volumes":      inspect.Config.Volumes,
 	}
-	rest := body[idx+len(key):]
-	rest = strings.TrimSpace(rest)
-	if len(rest) == 0 || rest[0] != '"' {
-		return ""
+	createBody["HostConfig"] = inspect.HostConfig
+	if len(inspect.NetworkSettings.Networks) > 2 { // not just "{}"
+		createBody["NetworkingConfig"] = map[string]json.RawMessage{
+			"EndpointsConfig": inspect.NetworkSettings.Networks,
+		}
 	}
-	rest = rest[1:]
-	end := strings.Index(rest, `"`)
-	if end < 0 {
-		return ""
+	createJSON, _ := json.Marshal(createBody)
+
+	// Write config to the data volume so the sidecar can read it.
+	updateConfigPath := filepath.Join(baseDir, ".update-config.json")
+	if err := os.WriteFile(updateConfigPath, createJSON, 0644); err != nil {
+		send("restart", "Failed to write update config: "+err.Error(), "error")
+		return
 	}
-	return rest[:end]
+
+	// Find the data volume name from the current container's binds.
+	dataVolume := "babymonitor-data" // fallback
+	var hostCfg struct {
+		Binds []string `json:"Binds"`
+	}
+	json.Unmarshal(inspect.HostConfig, &hostCfg)
+	for _, b := range hostCfg.Binds {
+		if strings.Contains(b, ":/app/data") {
+			dataVolume = strings.SplitN(b, ":", 2)[0]
+			break
+		}
+	}
+
+	// The updater script: reads config from the shared volume, recreates
+	// the main container, then lets AutoRemove clean up the sidecar.
+	updaterScript := fmt.Sprintf(`#!/bin/sh
+echo "[updater] Waiting for main container to finish responding..."
+sleep 3
+echo "[updater] Stopping %[1]s..."
+curl -sf --unix-socket /var/run/docker.sock -X POST "http://localhost/containers/%[1]s/stop?t=5" || true
+sleep 2
+echo "[updater] Removing old container..."
+curl -sf --unix-socket /var/run/docker.sock -X DELETE "http://localhost/containers/%[1]s" || true
+sleep 1
+echo "[updater] Creating new container..."
+RESP=$(curl -sf --unix-socket /var/run/docker.sock -X POST "http://localhost/containers/create?name=%[1]s" \
+  -H "Content-Type: application/json" -d @/data/.update-config.json)
+echo "[updater] Create response: $RESP"
+echo "[updater] Starting new container..."
+curl -sf --unix-socket /var/run/docker.sock -X POST "http://localhost/containers/%[1]s/start"
+echo "[updater] Done. Cleaning up config."
+rm -f /data/.update-config.json
+`, containerName)
+
+	// Clean up any leftover updater from a previous attempt.
+	dockerAPI("DELETE", "/containers/babymonitor-updater?force=true")
+
+	updaterConfig, _ := json.Marshal(map[string]interface{}{
+		"Image": updateImage,
+		"Cmd":   []string{"/bin/sh", "-c", updaterScript},
+		"HostConfig": map[string]interface{}{
+			"Binds":      []string{"/var/run/docker.sock:/var/run/docker.sock", dataVolume + ":/data"},
+			"AutoRemove": true,
+		},
+	})
+
+	if _, err := dockerAPIWithBody("POST", "/containers/create?name=babymonitor-updater", updaterConfig); err != nil {
+		send("restart", "Failed to create updater: "+err.Error(), "error")
+		os.Remove(updateConfigPath)
+		return
+	}
+	if _, err := dockerAPI("POST", "/containers/babymonitor-updater/start"); err != nil {
+		send("restart", "Failed to start updater: "+err.Error(), "error")
+		dockerAPI("DELETE", "/containers/babymonitor-updater?force=true")
+		os.Remove(updateConfigPath)
+		return
+	}
+
+	log.Printf("[update] Sidecar updater started — this container will be replaced shortly")
 }
 
 func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
