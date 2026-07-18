@@ -1342,6 +1342,35 @@ func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 
 	if inDocker() {
 		info["environment"] = "Docker"
+
+		// Docker image version — inspect our own container to get the image digest.
+		if hostname, err := os.Hostname(); err == nil {
+			if inspectBytes, err := dockerAPI("GET", "/containers/"+hostname+"/json"); err == nil {
+				var ci struct {
+					Image  string `json:"Image"`
+					Config struct {
+						Image  string            `json:"Image"`
+						Labels map[string]string `json:"Labels"`
+					} `json:"Config"`
+					Created string `json:"Created"`
+				}
+				if json.Unmarshal(inspectBytes, &ci) == nil {
+					if ci.Config.Image != "" {
+						info["image"] = ci.Config.Image
+					}
+					// Show short image ID (first 12 hex chars after "sha256:")
+					if id := ci.Image; len(id) > 19 {
+						info["image_id"] = id[7:19]
+					}
+					// Show container created time as the "version" timestamp
+					if ci.Created != "" {
+						if t, err := time.Parse(time.RFC3339Nano, ci.Created); err == nil {
+							info["image_date"] = t.Local().Format("2006-01-02 15:04")
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// DB stats

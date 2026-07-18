@@ -725,6 +725,9 @@ async function loadSystemInfo() {
       { label: 'Memory', value: info.memory },
       { label: 'Disk', value: info.disk },
       { label: 'Runs in', value: info.environment },
+      { label: 'Image', value: info.image },
+      { label: 'Image ID', value: info.image_id },
+      { label: 'Built', value: info.image_date },
     ];
     el.innerHTML = '';
     items.filter(i => i.value).forEach(i => {
