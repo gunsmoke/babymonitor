@@ -107,6 +107,14 @@ service cron start 2>/dev/null || cron 2>/dev/null || true
 # --- Ensure data dir permissions ---
 chown -R babypi:babypi /app/data 2>/dev/null || true
 
+# --- Docker socket access (for self-update) ---
+if [ -S /var/run/docker.sock ]; then
+    DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+    groupadd -g "$DOCKER_GID" hostdocker 2>/dev/null || true
+    usermod -aG hostdocker babypi 2>/dev/null || true
+    echo "[entrypoint] Docker socket accessible (GID $DOCKER_GID)"
+fi
+
 echo "[entrypoint] Starting Baby Monitor..."
 
 # --- Run the Go server as babypi user ---
